@@ -57,62 +57,106 @@ SKILLS_DIR = WORKDIR / "skills"
 
 # -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
+    """
+    技能加载器：自动扫描、解析、管理所有技能文件夹下的 SKILL.md
+    每个技能 = 一个目录 + 一个带YAML头的markdown文件
+    提供两层能力：
+    1）get_descriptions：给系统提示词用的技能列表
+    2）get_content：获取某个技能的完整内容
+    """
+
     def __init__(self, skills_dir: Path):
-        self.skills_dir = skills_dir
-        self.skills = {}
-        self._load_all()
+        """初始化：指定技能目录，自动加载所有技能"""
+        self.skills_dir = skills_dir  # 技能根目录，如 ./skills
+        self.skills = {}  # 内存存储所有技能：{技能名: {meta, body, path}}
+        self._load_all()  # 自动加载所有技能
 
     def _load_all(self):
+        """内部方法：递归扫描所有 SKILL.md 文件并加载"""
+        # 如果技能目录不存在，直接返回
         if not self.skills_dir.exists():
             return
+
+        # 递归找到所有子目录下的 SKILL.md
         for f in sorted(self.skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
+            text = f.read_text()  # 读取文件全文
+
+            # 拆分成 YAML 头部元信息 + 正文
             meta, body = self._parse_frontmatter(text)
+
+            # 技能名优先用 YAML 里的 name，没有就用文件夹名
             name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
+
+            # 把技能存入内存
+            self.skills[name] = {
+                "meta": meta,  # YAML 头：name, description, tags...
+                "body": body,  # 技能正文（教程/规则/提示词）
+                "path": str(f)  # 文件路径（方便调试）
+            }
 
     def _parse_frontmatter(self, text: str) -> tuple:
-        """Parse YAML frontmatter between --- delimiters."""
+        """解析 MD 文件的 YAML 头（--- 包裹的部分）"""
+        # 正则匹配：开头 --- ... --- 后面是正文
         match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+
+        # 没有 YAML 头 → 返回空meta + 原文
         if not match:
             return {}, text
+
         try:
+            # 解析 YAML 为字典
             meta = yaml.safe_load(match.group(1)) or {}
         except yaml.YAMLError:
+            # 解析失败 → 空字典
             meta = {}
+
+        # 返回 (meta字典, 正文内容)
         return meta, match.group(2).strip()
 
     def get_descriptions(self) -> str:
-        """Layer 1: short descriptions for the system prompt."""
+        """
+        第一层能力：给系统提示词用 → 简短技能列表（名字+描述）
+        让 LLM 知道自己有哪些技能可用
+        """
         if not self.skills:
             return "(no skills available)"
+
         lines = []
         for name, skill in self.skills.items():
             desc = skill["meta"].get("description", "No description")
             tags = skill["meta"].get("tags", "")
             line = f"  - {name}: {desc}"
             if tags:
-                line += f" [{tags}]"
+                line += f" [{tags}]"  # 有标签就追加显示
             lines.append(line)
+
         return "\n".join(lines)
 
     def get_content(self, name: str) -> str:
-        """Layer 2: full skill body returned in tool_result."""
+        """
+        第二层能力：LLM 调用 load_skill 后 → 返回完整技能内容
+        用 <skill> 标签包裹，方便模型识别这是技能文档
+        """
         skill = self.skills.get(name)
+
+        # 技能不存在 → 返回错误
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+
+        # 返回完整技能正文
         return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
 
 
+# ====================== 全局单例：整个程序共用一个技能加载器 ======================
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
-# Layer 1: skill metadata injected into system prompt
+# ====================== 系统提示词：把技能列表注入给模型 ======================
+# Layer 1：把技能列表注入系统提示，让模型知道自己会什么
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 
 Skills available:
 {SKILL_LOADER.get_descriptions()}"""
-
 
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
@@ -168,6 +212,7 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    # Layer 2：加载完整技能内容（模型调用该工具后获取完整技能教程）
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
