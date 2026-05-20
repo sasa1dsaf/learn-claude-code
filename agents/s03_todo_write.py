@@ -236,9 +236,29 @@ def agent_loop(messages: list):
         # 更新连续未使用 todo 的轮数
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 
-        # 如果连续 3 轮没更 todo → 强制注入提醒
+        # # 如果连续 3 轮没更 todo → 强制注入提醒
+        # if rounds_since_todo >= 3:
+        #     results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+
+        # 改进：
+        # 1. LLM 不调用 todo → 任务列表不会自动刷新在上下文中
+        # 2. 三轮没有调用TODO，只提醒 “更新任务” → 旧任务上下文被工具输出淹没，LLM 会幻觉
+        # 3. 提醒 + 把内存任务一起注入 → 让内存里的任务有了价值，能真正反向作用于 LLM
+        # 4. 形成完美闭环，任务进度不丢失、不幻觉、不跑偏
         if rounds_since_todo >= 3:
-            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            # 直接把内存里存的真实任务 渲染出来 塞回去！
+            todo_list_text = TODO.render()
+
+            # 强制提醒 + 标准答案一起给
+            reminder = f"""
+        <reminder>YOU MUST UPDATE YOUR TASK STATUS!
+        Below is YOUR REAL TASK LIST (from memory):
+
+        {todo_list_text}
+
+        Please update the status using the todo tool NOW.</reminder>
+            """
+            results.append({"type": "text", "text": reminder})
 
         # 把工具结果 + 提醒 喂给模型
         messages.append({"role": "user", "content": results})
