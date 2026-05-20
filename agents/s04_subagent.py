@@ -133,6 +133,7 @@ def run_subagent(prompt: str) -> str:
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         sub_messages.append({"role": "user", "content": results})
     # Only the final text returns to the parent -- child context is discarded
+    # 只把最后总结的一句话返回给父智能体（eg：我做完了XX任务，结果是XXX）
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
@@ -155,6 +156,7 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # 如果强行将task塞进 TOOL_HANDLERS，父智能体和子智能体无法做到上下文隔离
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
                     prompt = block.input.get("prompt", "")

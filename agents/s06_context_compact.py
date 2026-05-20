@@ -62,7 +62,7 @@ THRESHOLD = 500               # 自动压缩阈值：超过 50000 token 触发 L
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"  # 完整对话历史存档目录
 KEEP_RECENT = 3                  # Layer1：保留最近 3 条工具结果不压缩
 PRESERVE_RESULT_TOOLS = {"read_file"}  # 不压缩的工具（read_file 要保留原文）
-
+COMPACT_MIN_CONTENT_LEN = 100  # 👈 新加：统一配置压缩最小长度
 
 def estimate_tokens(messages: list) -> int:
     """粗略估算 token 数量：按 ~4 个字符 = 1 个 token 计算"""
@@ -72,47 +72,68 @@ def estimate_tokens(messages: list) -> int:
 # -- Layer 1: micro_compact 轻量压缩 --
 # 作用：每轮都悄悄执行，把太久远的工具结果替换成简短占位符
 def micro_compact(messages: list) -> list:
-    # 第一步：收集所有 tool_result 条目（消息索引、内容块索引、字典本身）
+    """
+    Layer 1 轻量压缩：
+    统一字典结构判断，一次遍历完成两件事：
+    1) 收集所有 tool_result
+    2) 构建 tool_use_id → tool_name 映射
+    彻底消除 dict / Pydantic 实例混用问题
+    """
     tool_results = []
+    tool_name_map = {}
+
+    # 👇 一次遍历，同时完成两件事，效率更高
     for msg_idx, msg in enumerate(messages):
-        # 只看 user 消息里的列表格式 content
-        if msg["role"] == "user" and isinstance(msg.get("content"), list):
-            for part_idx, part in enumerate(msg["content"]):
-                # 找到类型为 tool_result 的块
+        role = msg.get("role")
+        content = msg.get("content", [])
+
+        # 只处理列表格式的 content
+        if not isinstance(content, list):
+            continue
+
+        # --------------------------
+        # 1. 收集 assistant 的 tool_use（构建映射表）
+        # --------------------------
+        if role == "assistant":
+            for block in content:
+                # 👇 统一按字典判断，不再用 hasattr / Pydantic 判断
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_id = block.get("id")
+                    tool_name = block.get("name")
+                    if tool_id and tool_name:
+                        tool_name_map[tool_id] = tool_name
+
+        # --------------------------
+        # 2. 收集 user 的 tool_result
+        # --------------------------
+        if role == "user":
+            for part_idx, part in enumerate(content):
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     tool_results.append((msg_idx, part_idx, part))
 
-    # 如果工具结果总数 <= 保留数量，直接返回，不做压缩
+    # 不足保留数量，直接返回
     if len(tool_results) <= KEEP_RECENT:
         return messages
 
-    # 第二步：建立 tool_use_id → tool_name 映射表
-    # 从 assistant 的 tool_use 中找到对应工具名
-    tool_name_map = {}
-    for msg in messages:
-        if msg["role"] == "assistant":
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if hasattr(block, "type") and block.type == "tool_use":
-                        tool_name_map[block.id] = block.name
-
-    # 第三步：压缩【除了最近 KEEP_RECENT 条以外】的旧工具结果
-    # 例外：read_file 结果不压缩，避免重复读文件
+    # --------------------------
+    # 压缩旧的工具结果（保留最近 N 条）
+    # --------------------------
     to_clear = tool_results[:-KEEP_RECENT]
+
     for _, _, result in to_clear:
-        # 内容太短没必要压缩，跳过
-        if not isinstance(result.get("content"), str) or len(result["content"]) <= 100:
+        content = result.get("content", "")
+        # 👇 使用常量，不再硬编码 100
+        if not isinstance(content, str) or len(content) <= COMPACT_MIN_CONTENT_LEN:
             continue
 
         tool_id = result.get("tool_use_id", "")
         tool_name = tool_name_map.get(tool_id, "unknown")
 
-        # 配置里要保留的工具（如 read_file）跳过
+        # 白名单工具不压缩
         if tool_name in PRESERVE_RESULT_TOOLS:
             continue
 
-        # 核心：把长内容替换成简短占位符
+        # 替换为精简占位符
         result["content"] = f"[Previous: used {tool_name}]"
 
     return messages
@@ -120,38 +141,44 @@ def micro_compact(messages: list) -> list:
 
 # -- Layer 2: auto_compact 自动重度压缩 --
 # 作用：上下文超阈值时触发 → 存档完整历史 → LLM 总结 → 只保留总结
-def auto_compact(messages: list) -> list:
+def auto_compact(messages: list, focus: str = "") -> list:  # 👈 加了 focus 参数
     # 1. 把完整对话历史保存到磁盘（信息不丢失）
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
+    with open(transcript_path, "w", encoding="utf-8") as f:
         for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
+            f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
     print(f"[transcript saved: {transcript_path}]")
 
     # 2. 截取最后 80000 字符交给 LLM 做总结（避免超限）
     conversation_text = json.dumps(messages, default=str)[-80000:]
 
-    # 3. 调用模型生成总结：保留任务进度、当前状态、关键决策
+    # 3. 调用模型生成总结：支持 focus 聚焦
+    base_prompt = (
+        "Summarize this conversation for continuity. Include:\n"
+        "1) What was accomplished\n2) Current state\n3) Key decisions made\n"
+        "Be concise but preserve critical details."
+    )
+
+    # 👇 关键：把 focus 加进提示词
+    if focus.strip():
+        base_prompt += f"\n\nIMPORTANT FOCUS FOR SUMMARY: {focus.strip()}"
+
     response = client.messages.create(
         model=MODEL,
-        messages=[{"role": "user", "content":
-            "Summarize this conversation for continuity. Include: "
-            "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details.\n\n" + conversation_text}],
+        messages=[{"role": "user", "content": f"{base_prompt}\n\n{conversation_text}"}],
         max_tokens=2000,
     )
 
-    # 提取总结文本
     summary = next((block.text for block in response.content if hasattr(block, "text")), "")
     if not summary:
         summary = "No summary generated."
 
-    # 4. 用【单条总结】替换全部历史消息，大幅减少 token
+    # 4. 用【单条总结】替换全部历史消息
     messages[:] = [
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
     ]
-    return  messages
+    return messages
 
 
 # -- Tool implementations --
@@ -209,9 +236,6 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    # Layer 3：手动压缩工具（模型主动调用，触发总结压缩）
-    # 只是一个触发信号，实际逻辑在 agent_loop 里执行
-    "compact":    lambda **kw: "Manual compression requested.",
 }
 
 TOOLS = [
@@ -233,10 +257,10 @@ TOOLS = [
 # -- 主 Agent 循环：整合三层压缩 --
 def agent_loop(messages: list):
     while True:
-        # Layer 1：每轮调用 LLM 前先做轻量压缩
+        # Layer 1 -- micro_compact: 每次 LLM 调用前, 将旧的 tool result 替换为占位符。
         micro_compact(messages)
 
-        # Layer 2：超过 token 阈值 → 自动执行重度总结压缩
+        # Layer 2 -- auto_compact: token 超过阈值时, 保存完整对话到磁盘, 让 LLM 做摘要。
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             auto_compact(messages)
@@ -254,21 +278,32 @@ def agent_loop(messages: list):
 
         # 执行模型调用的工具
         results = []
-        manual_compact = False  # 标记：是否调用了 compact 工具（Layer3）
 
         for block in response.content:
             if block.type == "tool_use":
-                # 如果模型调用 compact 工具 → 标记手动压缩
+                # Layer 3 -- manual compact: compact 工具按需触发同样的压缩机制（auto_compact）。
                 if block.name == "compact":
-                    manual_compact = True
-                    output = "Compressing..."
-                else:
-                    # 执行普通工具
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
+                    # 获取 focus 参数
+                    focus = block.input.get("focus", "")
+                    print(f"[manual compact | focus: {focus}]")
+                    # 直接执行压缩
+                    auto_compact(messages, focus=focus)
+                    # 构造 tool_result
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": f"Compressed successfully! Focus: {focus or 'default'}"
+                    })
+                    # 结束本轮，不再执行其他工具
+                    messages.append({"role": "user", "content": results})
+                    return
+
+                # 普通工具逻辑
+                handler = TOOL_HANDLERS.get(block.name)
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
 
                 print(f"\033[33m> {block.name}:\033[0m")
                 print(str(output)[:200])
@@ -276,12 +311,6 @@ def agent_loop(messages: list):
 
         # 把工具结果加入上下文
         messages.append({"role": "user", "content": results})
-
-        # Layer 3：模型主动调用 compact → 立即重度压缩
-        if manual_compact:
-            print("[manual compact]")
-            auto_compact(messages)
-            return
 
 """
 疑问：为什么不能像 bash /read_file 那样在 handler 里直接执行 auto_compact？
