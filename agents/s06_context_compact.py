@@ -230,17 +230,17 @@ def agent_loop(messages: list):
 
         # 执行工具
         results = []
-        compact_needed = None  # 👈 标记是否需要 compact
+        manual_compact = None  # 👈 标记是否需要 compact
 
-        # 第一步：先执行所有普通工具
+        # 第一步：只标记manual_compact，先执行所有普通工具
         for block in response.content:
             if block.type == "tool_use":
-                # 如果是 compact，先标记，不立即执行
+                # Layer 3：模型主动调用 compact：先标记，不立即执行
                 if block.name == "compact":
-                    compact_needed = block
+                    manual_compact = block
                     continue
 
-                # 普通工具正常执行
+                # 第一步：普通工具正常执行
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
@@ -259,14 +259,21 @@ def agent_loop(messages: list):
             messages.append({"role": "user", "content": results})
 
         # 第二步：最后执行 compact（如果有）
-        if compact_needed:
-            block = compact_needed
+        if manual_compact:
+            block = manual_compact
             print("\n=== 🛠 Layer3: 模型调用compact工具 ===")
             focus = block.input.get("focus", "")
             print(f"🎯 Layer3 focus：{focus or '无'}")
             auto_compact(messages, focus=focus)
             return  # 最后再退出
 
+"""
+疑问：为什么不能像 bash /read_file 那样在 handler 里直接执行 auto_compact？
+解答：因为普通工具只需要零散参数（path、command）；压缩需要完整的全局对话列表 messages，
+     LLM 无法把内存变量 messages 传入工具函数、TOOL_HANDLERS 拿不到 messages
+ 👉 所以只能设计成：LLM 只发一个「要压缩」的信号 → 外层 agent_loop 拿到信号 
+    → 自己动手操作 messages 做压缩
+"""
 
 if __name__ == "__main__":
     history = []
