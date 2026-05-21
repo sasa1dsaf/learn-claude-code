@@ -68,7 +68,13 @@ MODEL = os.environ["MODEL_ID"]
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 
-SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
+# 主智能体（领队）系统提示
+SYSTEM = (f"""You are a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes.
+Important rule:
+1. When teammates status is idle, they have stopped running and cannot receive messages automatically.
+2. You MUST use spawn_teammate tool to restart idle teammates if you need them to process new inbox messages.
+3. Sending messages only writes content to file, will not wake idle teammates up.
+""")
 
 VALID_MSG_TYPES = {
     "message",
@@ -81,7 +87,7 @@ VALID_MSG_TYPES = {
 # -- Request trackers: correlate by request_id --
 shutdown_requests = {}
 plan_requests = {}
-_tracker_lock = threading.Lock()
+_tracker_lock = threading.Lock() # 用来防止多个队友同时修改 shutdown_requests /plan_requests 字典，导致数据错乱
 
 
 # -- MessageBus: JSONL inbox per teammate --
