@@ -40,60 +40,127 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 TASKS_DIR = WORKDIR / ".tasks"
 
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
+SYSTEM = (
+    f"You are a coding agent working at {WORKDIR}.\n"
+    f"- For system commands, **ONLY use PowerShell commands** (DO NOT use cmd.exe commands like dir, use PowerShell equivalents like Get-ChildItem or ls).\n"
+    f"- DO NOT use Linux commands (ls, cat, pwd, rm -rf, cp, mv are NOT allowed).\n"
+    f"- Use PowerShell syntax correctly.\n"
+    f"- Use tools to solve tasks correctly and safely."
+)
+import json
+from pathlib import Path
 
 
-# -- TaskManager: CRUD with dependency graph, persisted as JSON files --
+# -- TaskManager: 任务管理类，支持CRUD操作、依赖关系管理，数据持久化为JSON文件 --
 class TaskManager:
     def __init__(self, tasks_dir: Path):
+        """
+        初始化任务管理器
+        :param tasks_dir: 存储任务JSON文件的目录路径
+        """
+        # 任务文件存储目录
         self.dir = tasks_dir
+        # 确保目录存在，不存在则创建
         self.dir.mkdir(exist_ok=True)
+        # 初始化下一个任务ID，基于当前最大ID自增
         self._next_id = self._max_id() + 1
 
     def _max_id(self) -> int:
+        """
+        私有方法：获取当前目录中最大的任务ID，用于生成新任务ID
+        :return: 最大任务ID，无任务时返回0
+        """
+        # 遍历所有task_*.json文件，提取数字ID
         ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
         return max(ids) if ids else 0
 
     def _load(self, task_id: int) -> dict:
+        """
+        私有方法：从文件加载指定ID的任务数据
+        :param task_id: 任务ID
+        :return: 任务字典数据
+        """
         path = self.dir / f"task_{task_id}.json"
+        # 任务不存在则抛出异常
         if not path.exists():
             raise ValueError(f"Task {task_id} not found")
+        # 读取并解析JSON
         return json.loads(path.read_text())
 
     def _save(self, task: dict):
+        """
+        私有方法：将任务数据保存为JSON文件
+        :param task: 任务字典（必须包含id字段）
+        """
         path = self.dir / f"task_{task['id']}.json"
+        # 格式化写入JSON，支持中文
         path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
 
     def create(self, subject: str, description: str = "") -> str:
+        """
+        创建新任务
+        :param subject: 任务主题（必填）
+        :param description: 任务描述（可选）
+        :return: 格式化后的新任务JSON字符串
+        """
+        # 构造新任务基础数据
         task = {
             "id": self._next_id, "subject": subject, "description": description,
             "status": "pending", "blockedBy": [], "owner": "",
         }
+        # 保存到文件
         self._save(task)
+        # 自增下一个任务ID
         self._next_id += 1
         return json.dumps(task, indent=2, ensure_ascii=False)
 
     def get(self, task_id: int) -> str:
+        """
+        获取单个任务详情
+        :param task_id: 任务ID
+        :return: 格式化后的任务JSON字符串
+        """
         return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
 
     def update(self, task_id: int, status: str = None,
                add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
+        """
+        更新任务：状态、添加依赖、移除依赖
+        :param task_id: 任务ID
+        :param status: 任务状态（pending/in_progress/completed）
+        :param add_blocked_by: 要添加的依赖任务ID列表
+        :param remove_blocked_by: 要移除的依赖任务ID列表
+        :return: 更新后的任务JSON字符串
+        """
+        # 加载原任务
         task = self._load(task_id)
+
+        # 更新状态（仅当传入有效值时）
         if status:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Invalid status: {status}")
             task["status"] = status
+            # 完成任务时，自动清理其他任务对该任务的依赖
             if status == "completed":
                 self._clear_dependency(task_id)
+
+        # 添加依赖（去重）
         if add_blocked_by:
             task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+
+        # 移除依赖
         if remove_blocked_by:
             task["blockedBy"] = [x for x in task["blockedBy"] if x not in remove_blocked_by]
+
+        # 保存更新
         self._save(task)
         return json.dumps(task, indent=2, ensure_ascii=False)
 
     def _clear_dependency(self, completed_id: int):
-        """Remove completed_id from all other tasks' blockedBy lists."""
+        """
+        私有方法：任务完成后，从所有其他任务的依赖列表中移除该任务
+        :param completed_id: 已完成的任务ID
+        """
         for f in self.dir.glob("task_*.json"):
             task = json.loads(f.read_text())
             if completed_id in task.get("blockedBy", []):
@@ -101,23 +168,38 @@ class TaskManager:
                 self._save(task)
 
     def list_all(self) -> str:
+        """
+        列出所有任务（格式化展示状态、ID、主题、依赖）
+        :return: 任务列表字符串
+        """
         tasks = []
+        # 按任务ID数字排序文件
         files = sorted(
             self.dir.glob("task_*.json"),
             key=lambda f: int(f.stem.split("_")[1])
         )
+
+        # 加载所有任务
         for f in files:
             tasks.append(json.loads(f.read_text()))
+
+        # 无任务时返回提示
         if not tasks:
             return "No tasks."
+
+        # 格式化输出每行任务信息
         lines = []
         for t in tasks:
+            # 状态标记：待办/进行中/已完成
             marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
+            # 显示依赖关系
             blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
             lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+
         return "\n".join(lines)
 
 
+# 全局任务管理器实例（需提前定义 TASKS_DIR 变量）
 TASKS = TaskManager(TASKS_DIR)
 
 
@@ -218,7 +300,7 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}:")
+                print(f"\033[33m> {block.name}:{block.input}\033[0m")
                 print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})

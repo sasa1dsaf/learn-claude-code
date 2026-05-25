@@ -46,68 +46,111 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
-# -- BackgroundManager: threaded execution + notification queue --
+# -- BackgroundManager: 线程安全的后台任务管理器 + 完成通知队列 --
+# 作用：让 Agent 不阻塞，异步执行长耗时命令（npm install、docker build、pytest 等）
 class BackgroundManager:
     def __init__(self):
-        self.tasks = {}  # task_id -> {status, result, command}
-        self._notification_queue = []  # completed task results
+        # 存储所有后台任务：key=任务ID，value=任务详情（状态、结果、命令）
+        self.tasks = {}
+        # 通知队列：存放【已完成】的任务结果，线程安全
+        self._notification_queue = []
+        # 线程锁：防止多线程同时修改队列，导致数据错乱
         self._lock = threading.Lock()
 
     def run(self, command: str) -> str:
-        """Start a background thread, return task_id immediately."""
+        """
+        启动一个后台线程执行命令，**立刻返回**，不等待执行完成
+        :param command: 要执行的 shell 命令
+        :return: 任务启动提示信息（含任务ID）
+        """
+        # 生成唯一短任务ID（UUID 前8位）
         task_id = str(uuid.uuid4())[:8]
+        # 初始化任务信息：运行中、暂无结果、记录执行命令
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+
+        # 创建守护线程，执行 _execute 函数
+        # daemon=True：主线程退出时，子线程自动退出
         thread = threading.Thread(
             target=self._execute, args=(task_id, command), daemon=True
         )
+        # 启动线程 → 命令后台运行，主线程立刻继续
         thread.start()
+
+        # 立即返回，不等待命令执行完
         return f"Background task {task_id} started: {command[:80]}"
 
     def _execute(self, task_id: str, command: str):
-        """Thread target: run subprocess, capture output, push to queue."""
+        """
+        【线程内部执行函数】：真正运行 shell 命令，捕获输出
+        这个函数运行在独立子线程中
+        """
         try:
+            # 执行 shell 命令，捕获标准输出+标准错误，超时5分钟
+            # 启动系统进程， 把command 丢给操作系统执行
+            # 不是 Python 自己跑， GIL 自动释放，其他线程可以同时运行，实现并发
             r = subprocess.run(
                 command, shell=True, cwd=WORKDIR,
                 capture_output=True, text=True, timeout=300
             )
+            # 拼接输出，限制最大长度（防止超长卡死LLM）
             output = (r.stdout + r.stderr).strip()[:50000]
-            status = "completed"
+            status = "completed"  # 执行完成
+
+        # 捕获超时异常
         except subprocess.TimeoutExpired:
             output = "Error: Timeout (300s)"
             status = "timeout"
+
+        # 捕获其他所有异常
         except Exception as e:
             output = f"Error: {e}"
             status = "error"
+
+        # 更新任务状态与结果
         self.tasks[task_id]["status"] = status
         self.tasks[task_id]["result"] = output or "(no output)"
+
+        # 加锁 → 将完成的任务加入通知队列（线程安全）
         with self._lock:
             self._notification_queue.append({
                 "task_id": task_id,
                 "status": status,
                 "command": command[:80],
-                "result": (output or "(no output)")[:500],
+                "result": (output or "(no output)")[:500],  # 截断超长结果
             })
 
     def check(self, task_id: str = None) -> str:
-        """Check status of one task or list all."""
+        """
+        查询任务状态
+        :param task_id: 传ID查单个任务，不传则返回所有任务
+        :return: 状态文本
+        """
+        # 查询单个任务
         if task_id:
             t = self.tasks.get(task_id)
             if not t:
                 return f"Error: Unknown task {task_id}"
             return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+
+        # 查询所有任务
         lines = []
         for tid, t in self.tasks.items():
             lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
         return "\n".join(lines) if lines else "No background tasks."
 
     def drain_notifications(self) -> list:
-        """Return and clear all pending completion notifications."""
+        """
+        取出所有【已完成任务的通知】，并清空队列
+        每次 LLM 思考前调用，把后台结果喂给模型
+        :return: 通知列表
+        """
         with self._lock:
             notifs = list(self._notification_queue)
             self._notification_queue.clear()
         return notifs
 
 
+# 全局单例：整个Agent共用一个后台任务管理器
 BG = BackgroundManager()
 
 
@@ -209,7 +252,7 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}:")
+                print(f"\033[33m> {block.name}:{block.input}\033[0m")
                 print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
